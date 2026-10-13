@@ -6,12 +6,8 @@ processing batches of clinical notes. Each actor instance holds a single
 AnalyzerEngine with regex-based recognizers, and uses pre-computed DL results
 passed via ad-hoc recognizers.
 
-Architecture:
-    RecognizerSupervisor (used by map_batches)
-        └── RecognizerWorker (does actual processing, can be killed on timeout)
-
-    The supervisor pattern enables true note-level timeouts. When a note hangs,
-    ray.kill() terminates the worker process and a new worker is spawned.
+Ray Data drives ``RecognizerWorker`` directly; a hang is caught by Ray Data's
+execution-level no-progress timeout.
 
 Thread/Process Safety:
     Each Actor maintains its own AnalyzerEngine instance. A blank spaCy tokenizer
@@ -20,16 +16,16 @@ Thread/Process Safety:
     recognizers per-note.
 """
 
+import hashlib
 import json
 import logging
-import math
 import time as _time
 from datetime import UTC
 from datetime import datetime
+from functools import partial
 from typing import Any
 
-import numpy as np
-import ray
+import orjson
 from presidio_analyzer import AnalyzerEngine
 from presidio_analyzer import EntityRecognizer
 from presidio_analyzer import RecognizerRegistry
@@ -54,7 +50,12 @@ from tide2.recognizers import UrlRecognizer
 from tide2.recognizers import create_cached_recognizer
 from tide2.recognizers import create_recognizers_for_patient
 from tide2.utils.batch_columns import BatchColumns
+from tide2.utils.batch_columns import type_columns
+from tide2.utils.nulls import is_null
+from tide2.utils.nulls import row_id_patient_part
 from tide2.utils.span_metrics import resolve_recognizer_results
+from tide2.utils.stage_status import NoteError
+from tide2.utils.stage_status import handle_row
 
 
 class _BlankSpacyNlpEngine(SpacyNlpEngine):
@@ -74,20 +75,54 @@ class _BlankSpacyNlpEngine(SpacyNlpEngine):
         self.ner_model_configuration = NerModelConfiguration()
 
 
+class _DeduplicateLogFilter(logging.Filter):
+    """Suppress duplicate log messages to prevent console flood during multi-worker execution.
+
+    Repeated identical warnings (e.g. from Presidio recognizers or regex engines)
+    can saturate stdout/stderr when running across many concurrent CPU workers.
+    This filter only permits each unique (level, message_template) pair once per process.
+    """
+
+    def __init__(self, max_entries: int = 1000) -> None:
+        super().__init__()
+        self._seen: set[tuple[int, str]] = set()
+        self._max_entries = max_entries
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        key = (record.levelno, str(record.msg))
+        if key in self._seen:
+            return False
+        if len(self._seen) < self._max_entries:
+            self._seen.add(key)
+        return True
+
+
+# One filter per process, matching the "once per process" contract above. Every
+# worker constructed in this process installs the same instance, so restarted or
+# pooled workers don't stack a new filter (and a new seen-set) on the shared
+# loggers each time.
+_DEDUPLICATE_LOG_FILTER = _DeduplicateLogFilter()
+_DEDUPLICATE_LOG_TARGETS = (
+    "presidio-analyzer",
+    "tide2",
+    "tide2.actors.recognizer",
+    "tide2.actors.anonymizer",
+    "tide2.actors.transformer",
+    "tide2.actors.llm_recognizer",
+)
+
+
+def _install_deduplicate_log_filter() -> None:
+    """Attach the process-wide dedup filter to the noisy child loggers, at most once."""
+    for name in _DEDUPLICATE_LOG_TARGETS:
+        target = logging.getLogger(name)
+        if _DEDUPLICATE_LOG_FILTER not in target.filters:
+            target.addFilter(_DEDUPLICATE_LOG_FILTER)
+
+
 # Threshold constants for logging
 LONG_NOTE_CHAR_THRESHOLD = 100_000
 SLOW_PROCESSING_SECONDS = 10
-
-# Per-note timeout - worker is killed if exceeded
-# 60s is sufficient based on benchmarks; anything longer indicates a hang
-NOTE_PROCESSING_TIMEOUT_SECONDS = 60
-
-
-class NoteProcessingTimeoutError(Exception):
-    """Raised when note processing exceeds the timeout limit."""
-
-    pass
-
 
 # Long note chunking parameters
 # Notes longer than this will be processed in chunks to avoid memory issues
@@ -130,21 +165,6 @@ ALL_SUPPORTED_ENTITIES = [
 logger = logging.getLogger(__name__)
 
 
-def _is_null(value: Any) -> bool:
-    """Check if a value is null/NaN (handles numpy NaN, None, and pandas NA)."""
-    if value is None:
-        return True
-    try:
-        # Handle numpy/pandas null values
-        if isinstance(value, float) and math.isnan(value):
-            return True
-        if isinstance(value, (np.floating, np.integer)) and np.isnan(value):
-            return True
-    except (TypeError, ValueError):
-        pass
-    return False
-
-
 class NoOpContextEnhancer(ContextAwareEnhancer):
     """No-op context enhancer that returns results unchanged for maximum batch throughput."""
 
@@ -183,14 +203,11 @@ class NoOpContextEnhancer(ContextAwareEnhancer):
         return raw_results
 
 
-@ray.remote
 class RecognizerWorker:
     """
-    Ray Actor that does the actual recognition processing.
+    Worker class that executes recognition processing directly under Ray Data.
 
-    This worker holds the AnalyzerEngine state and processes individual notes.
-    It is managed by RecognizerSupervisor which handles timeouts by killing
-    and respawning this worker if a note hangs.
+    This worker holds the AnalyzerEngine state and processes batches of notes.
 
     Attributes:
         analyzer: The Presidio AnalyzerEngine instance with regex recognizers.
@@ -256,6 +273,9 @@ class RecognizerWorker:
             context_aware_enhancer=NoOpContextEnhancer(),  # No-op enhancer for batch performance
         )
 
+        # Attach deduplicate log filter to suppress repeated Presidio warnings
+        _install_deduplicate_log_filter()
+
         logger.info("RecognizerWorker initialized with optimized AnalyzerEngine")
 
     def process_note(
@@ -267,9 +287,6 @@ class RecognizerWorker:
     ) -> dict[str, Any]:
         """
         Process a single note and return results.
-
-        This method is called by RecognizerSupervisor for each note.
-        If this method hangs, the supervisor will kill this worker via ray.kill().
 
         Args:
             note_text: The note text to process.
@@ -283,13 +300,11 @@ class RecognizerWorker:
         start_time = _time.time()
 
         # Handle empty/null notes
-        if not note_text or _is_null(note_text):
+        if is_null(note_text) or not note_text:
             return {
                 "text_hash": text_hash,
                 "recognizer_results_json": "[]",
                 "entity_count": 0,
-                "processing_status": "success",
-                "error_message": None,
             }
 
         note_len = len(note_text)
@@ -330,8 +345,6 @@ class RecognizerWorker:
             "text_hash": text_hash,
             "recognizer_results_json": results_json,
             "entity_count": len(analyzer_results),
-            "processing_status": "success",
-            "error_message": None,
         }
 
     def _build_ad_hoc_recognizers(
@@ -340,25 +353,33 @@ class RecognizerWorker:
         patient_identifiers: str | dict | None,
         text_hash: str,
     ) -> list:
-        """Build list of ad-hoc recognizers for a note."""
+        """Build list of ad-hoc recognizers for a note.
+
+        Raises:
+            NoteError: If ``patient_identifiers`` or the cached results are malformed.
+        """
         ad_hoc_recognizers = []
 
         # Add cached DL results recognizer if available
-        if cached_results and not _is_null(cached_results):
+        if not is_null(cached_results) and cached_results:
             cached_recognizer = create_cached_recognizer(results=cached_results)
             ad_hoc_recognizers.append(cached_recognizer)
 
         # Add known values recognizers if patient PHI is available
-        if patient_identifiers and not _is_null(patient_identifiers):
-            try:
-                phi_dict = (
-                    json.loads(patient_identifiers) if isinstance(patient_identifiers, str) else patient_identifiers
-                )
-                if phi_dict and isinstance(phi_dict, dict):
-                    known_value_recognizers = create_recognizers_for_patient(phi_dict)
-                    ad_hoc_recognizers.extend(known_value_recognizers)
-            except (json.JSONDecodeError, TypeError) as e:
-                logger.warning(f"Failed to parse patient_identifiers for note {text_hash}: {e}")
+        if not is_null(patient_identifiers) and patient_identifiers:
+            if isinstance(patient_identifiers, dict):
+                phi_dict = patient_identifiers
+            elif isinstance(patient_identifiers, (str, bytes)):
+                try:
+                    phi_dict = orjson.loads(patient_identifiers)
+                except orjson.JSONDecodeError as e:
+                    raise NoteError("patient_identifiers") from e
+            else:
+                raise NoteError("patient_identifiers")
+
+            if not isinstance(phi_dict, dict):
+                raise NoteError("patient_identifiers")
+            ad_hoc_recognizers.extend(create_recognizers_for_patient(phi_dict))
 
         return ad_hoc_recognizers
 
@@ -462,8 +483,6 @@ class RecognizerWorker:
     def process_batch(self, batch: dict[str, Any]) -> dict[str, list[Any]]:
         """
         Process a batch of notes in a single call. No IPC per note.
-
-        Called by RecognizerSupervisor to avoid per-note ray.get() overhead.
         Each note is processed via process_note() internally.
 
         Args:
@@ -473,10 +492,14 @@ class RecognizerWorker:
             Dictionary with columnar results for all notes in the batch.
         """
         out_text_hashes = []
+        out_note_texts = []
+        out_patient_ids = []
+        out_row_ids = []
+        out_jitters = []
         results_json_list = []
         entity_counts = []
         processing_statuses = []
-        error_messages = []
+        stage_statuses = []
 
         cols = BatchColumns(batch)
         batch_size = len(cols["note_text"])
@@ -484,152 +507,70 @@ class RecognizerWorker:
         input_text_hashes = cols["text_hash"]
         cached_results_col = cols.get("recognizer_results_json", [None] * batch_size)
         patient_identifiers_col = cols.get("patient_identifiers", [None] * batch_size)
+        patient_ids_col = cols.get("patient_id", [None] * batch_size)
+        jitters_col = cols.get("jitter", [None] * batch_size)
+        row_ids_col = cols.get("row_id", [None] * batch_size)
+        upstream_status_col = cols.get("processing_status", [None] * batch_size)
+        upstream_stage_col = cols.get("stage_status_json", [None] * batch_size)
+        has_jitter = "jitter" in cols
+        has_row_id = "row_id" in cols
 
         for i in range(batch_size):
-            note_text = note_texts[i]
+            raw_note = note_texts[i]
+            note_text = "" if is_null(raw_note) else str(raw_note)
             text_hash = input_text_hashes[i]
-            cached_results = cached_results_col[i]
-            patient_identifiers = patient_identifiers_col[i]
+            p_id = patient_ids_col[i]
 
-            try:
-                result = self.process_note(
+            if has_row_id and not is_null(row_ids_col[i]):
+                r_id = row_ids_col[i]
+            else:
+                r_id = hashlib.sha256(f"{text_hash}:{row_id_patient_part(p_id)}".encode()).hexdigest()
+
+            result, stage_json, status = handle_row(
+                logger,
+                "recognizer",
+                text_hash,
+                upstream_status_col[i],
+                upstream_stage_col[i],
+                partial(
+                    self.process_note,
                     note_text=note_text,
                     text_hash=text_hash,
-                    cached_results=cached_results,
-                    patient_identifiers=patient_identifiers,
-                )
-                out_text_hashes.append(result["text_hash"])
-                results_json_list.append(result["recognizer_results_json"])
-                entity_counts.append(result["entity_count"])
-                processing_statuses.append(result["processing_status"])
-                error_messages.append(result["error_message"])
-            except Exception:
-                logger.exception("Error processing note %s in batch, skipping (will retry on next run)", text_hash)
-                continue
+                    cached_results=cached_results_col[i],
+                    patient_identifiers=patient_identifiers_col[i],
+                ),
+            )
 
-        return {
+            out_text_hashes.append(text_hash)
+            out_note_texts.append(note_text)
+            out_patient_ids.append(p_id)
+            out_row_ids.append(r_id)
+            if has_jitter:
+                out_jitters.append(jitters_col[i])
+            results_json_list.append(None if result is None else result["recognizer_results_json"])
+            entity_counts.append(None if result is None else result["entity_count"])
+            processing_statuses.append(status)
+            stage_statuses.append(stage_json)
+
+        batch_timestamp = datetime.now(UTC).isoformat()
+        res = {
             "text_hash": out_text_hashes,
+            "note_text": out_note_texts,
+            "patient_id": out_patient_ids,
+            "row_id": out_row_ids,
             "recognizer_results_json": results_json_list,
             "entity_count": entity_counts,
+            "processing_timestamp": [batch_timestamp] * len(out_text_hashes),
             "processing_status": processing_statuses,
-            "error_message": error_messages,
+            "stage_status_json": stage_statuses,
         }
-
-
-class RecognizerSupervisor:
-    """
-    Supervisor actor that wraps RecognizerWorker with batch-level timeout.
-
-    This actor is used by Ray Data's map_batches(). It sends the entire batch
-    to the worker in a single remote call to avoid per-note IPC overhead.
-    If the batch times out, the worker is killed and respawned.
-    """
-
-    # Batch timeout: generous enough for large/slow batches, short enough to detect hangs.
-    # At ~50ms/note, 100 notes = 5s expected. 120s allows for outlier notes.
-    BATCH_TIMEOUT_SECONDS = 120
-
-    def __init__(
-        self,
-        batch_timeout: int = BATCH_TIMEOUT_SECONDS,
-        worker_num_cpus: int | float | None = None,
-    ) -> None:
-        """
-        Initialize supervisor with a worker actor.
-
-        Args:
-            batch_timeout: Seconds before a batch is killed and marked failed.
-            worker_num_cpus: CPUs to reserve for each worker actor. None = Ray
-                default (1). Set lower to fit small boxes.
-        """
-        self.batch_timeout = batch_timeout
-        self._worker_num_cpus = worker_num_cpus
-        self.worker = self._spawn_worker()
-        self.worker_kills = 0
-        logger.info(
-            f"RecognizerSupervisor initialized with {self.batch_timeout}s batch timeout, "
-            f"worker_num_cpus={self._worker_num_cpus}"
-        )
-
-    def _spawn_worker(self) -> ray.actor.ActorHandle:
-        """Create a new RecognizerWorker, applying the CPU override when set."""
-        cls = RecognizerWorker
-        if self._worker_num_cpus is not None:
-            cls = cls.options(num_cpus=self._worker_num_cpus)
-        return cls.remote()
+        if has_jitter:
+            res["jitter"] = out_jitters
+        return type_columns(res)
 
     def __call__(self, batch: dict[str, Any]) -> dict[str, list[Any]]:
-        """
-        Process a batch of notes via a single remote call to worker.
-
-        Sends the entire batch to worker.process_batch() in one ray.get().
-        If timeout occurs, kills worker, respawns, and marks all notes as failed.
-
-        Args:
-            batch: Dictionary with columnar data from Ray Data.
-
-        Returns:
-            Dictionary with processed results in columnar format.
-        """
-        cols = BatchColumns(batch)
-        batch_size = len(cols["note_text"])
-        batch_timestamp = datetime.now(UTC).isoformat()
-
-        try:
-            ref = self.worker.process_batch.remote(batch)
-            result = ray.get(ref, timeout=self.batch_timeout)
-
-            # Add timestamp column (use actual result size since failed notes are skipped)
-            result_size = len(result["text_hash"])
-            result["processing_timestamp"] = [batch_timestamp] * result_size
-
-        except ray.exceptions.GetTimeoutError:
-            logger.warning(f"Batch timeout after {self.batch_timeout}s ({batch_size} notes), killing worker")
-            ray.kill(self.worker)
-            self.worker = self._spawn_worker()
-            self.worker_kills += 1
-
-            return self._failed_batch(
-                batch,
-                f"BatchTimeout: exceeded {self.batch_timeout}s for {batch_size} notes",
-            )
-
-        except ray.exceptions.ActorDiedError as e:
-            logger.warning("Worker died processing batch of %d notes, respawning", batch_size)
-            self.worker = self._spawn_worker()
-            self.worker_kills += 1
-
-            return self._failed_batch(
-                batch,
-                f"ActorDiedError: {str(e)[:400]}",
-            )
-
-        except Exception as e:
-            logger.exception("Error processing batch of %d notes", batch_size)
-
-            return self._failed_batch(
-                batch,
-                f"{type(e).__name__}: {str(e)[:400]}",
-            )
-
-        else:
-            return result
-
-    def _failed_batch(self, batch: dict[str, Any], error: str) -> dict[str, list[Any]]:
-        """Log failure and return empty result so failed notes are not checkpointed."""
-        cols = BatchColumns(batch)
-        text_hashes = list(cols["text_hash"])
-        for th in text_hashes:
-            logger.error("Note %s failed: %s (will retry on next run)", th, error)
-        return {
-            "text_hash": [],
-            "recognizer_results_json": [],
-            "entity_count": [],
-            "processing_timestamp": [],
-            "processing_status": [],
-            "error_message": [],
-        }
+        """Process a batch of notes directly under Ray Data map_batches."""
+        return self.process_batch(batch)
 
 
-# Backwards compatibility alias
-RecognizerActor = RecognizerSupervisor
+RecognizerActor = RecognizerWorker

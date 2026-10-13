@@ -2,8 +2,7 @@
 
 Covers the behaviour introduced for ≲4-CPU boxes (e.g. Google Colab):
 
-1. Supervisor ``worker_num_cpus`` override is applied to the worker actor only
-   when set (``.options(num_cpus=...)``), never otherwise.
+1. ``worker_num_cpus`` sets the CPUs one actor reserves (1.0 when unset).
 2. ``_configure_checkpoint`` gates Ray Data checkpointing on ``enable`` and uses
    the expected ``id_column``.
 3. Each stage's read/write (and the transformer's flat_map) carry the expected
@@ -21,89 +20,67 @@ import ray
 
 import tide2.runner.local_runner as lr
 from tide2.runner.local_runner import _configure_checkpoint
+from tide2.runner.local_runner import _resolve_slot_cpus
 
 # ---------------------------------------------------------------------------
-# 1. Supervisor worker_num_cpus override gating
+# 1. Slot CPU resolution rule & map_batches pool configuration
 # ---------------------------------------------------------------------------
 
 
-class TestWorkerCpuOverride:
-    """The worker CPU override must apply .options() only when explicitly set."""
+class TestSlotCpuResolution:
+    """One actor reserves worker_num_cpus CPUs, or 1.0 when it is unset."""
 
-    def test_recognizer_no_override(self, monkeypatch):
-        from tide2.actors import recognizer
+    @pytest.mark.parametrize(
+        ("worker_num_cpus", "expected_slot_cpus"),
+        [(None, 1.0), (1.0, 1.0), (0.25, 0.25), (0, 0.0), (1.5, 1.5)],
+    )
+    def test_resolve_slot_cpus(self, worker_num_cpus, expected_slot_cpus):
+        slot_cpus, ray_remote_args, resolved = _resolve_slot_cpus(worker_num_cpus)
+        assert slot_cpus == expected_slot_cpus
+        assert ray_remote_args["num_cpus"] == expected_slot_cpus
+        assert resolved["resolved_slot_cpus"] == expected_slot_cpus
 
-        mock_worker = MagicMock()
-        monkeypatch.setattr(recognizer, "RecognizerWorker", mock_worker)
+    def test_map_batches_receives_worker_class(self, monkeypatch, tmp_path):
+        from tide2.actors.recognizer import RecognizerWorker
 
-        recognizer.RecognizerSupervisor(worker_num_cpus=None)
+        runner = lr.LocalJobRunner()
+        monkeypatch.setattr(runner, "_init_ray", lambda: None)
+        monkeypatch.setattr(lr, "detect_columns", lambda *_a, **_k: ["text_hash", "note_text"])
+        monkeypatch.setattr(lr, "resolve_input_files", lambda _p: ["/fake/in.parquet"])
 
-        mock_worker.options.assert_not_called()
-        mock_worker.remote.assert_called_once_with()
+        captured_map_batches = {}
+        fake_ds = MagicMock()
 
-    def test_recognizer_with_override(self, monkeypatch):
-        from tide2.actors import recognizer
+        def fake_mb(fn, *args, **kwargs):
+            captured_map_batches["fn"] = fn
+            captured_map_batches["args"] = args
+            captured_map_batches["kwargs"] = kwargs
+            return fake_ds
 
-        mock_worker = MagicMock()
-        monkeypatch.setattr(recognizer, "RecognizerWorker", mock_worker)
-
-        recognizer.RecognizerSupervisor(worker_num_cpus=0.75)
-
-        mock_worker.options.assert_called_once_with(num_cpus=0.75)
-        mock_worker.options.return_value.remote.assert_called_once_with()
-        mock_worker.remote.assert_not_called()
-
-    def test_anonymizer_no_override(self, monkeypatch):
-        from tide2.actors import anonymizer
-
-        mock_worker = MagicMock()
-        monkeypatch.setattr(anonymizer, "AnonymizerWorker", mock_worker)
-
-        Actor = anonymizer.create_anonymizer_actor(  # noqa: N806 # it's a type
-            salt=b"\x00" * 32, key=b"\x11" * 32, worker_num_cpus=None
+        fake_ds.map_batches.side_effect = fake_mb
+        monkeypatch.setattr(ray.data, "read_parquet", lambda *_a, **_k: fake_ds)
+        monkeypatch.setattr(lr, "configure_data_context", lambda **_k: None)
+        monkeypatch.setattr(
+            ray.data.DataContext,
+            "get_current",
+            staticmethod(lambda: SimpleNamespace(checkpoint_config=None)),
         )
-        Actor()
 
-        mock_worker.options.assert_not_called()
-        mock_worker.remote.assert_called_once()
-
-    def test_anonymizer_with_override(self, monkeypatch):
-        from tide2.actors import anonymizer
-
-        mock_worker = MagicMock()
-        monkeypatch.setattr(anonymizer, "AnonymizerWorker", mock_worker)
-
-        Actor = anonymizer.create_anonymizer_actor(  # noqa: N806 # it's a type
-            salt=b"\x00" * 32, key=b"\x11" * 32, worker_num_cpus=0.5
+        runner.run_recognition(
+            input_path="in",
+            output_path=str(tmp_path / "out"),
+            num_actors=4,
+            worker_num_cpus=0.5,
+            enable_checkpoint=False,
         )
-        Actor()
 
-        mock_worker.options.assert_called_once_with(num_cpus=0.5)
-        mock_worker.options.return_value.remote.assert_called_once()
-        mock_worker.remote.assert_not_called()
-
-    def test_llm_recognizer_no_override(self, monkeypatch):
-        from tide2.actors import llm_recognizer
-
-        mock_worker = MagicMock()
-        monkeypatch.setattr(llm_recognizer, "LlmRecognizerWorker", mock_worker)
-
-        llm_recognizer.LlmRecognizerSupervisor(project_id="proj", worker_num_cpus=None)
-
-        mock_worker.options.assert_not_called()
-        mock_worker.remote.assert_called_once()
-
-    def test_llm_recognizer_with_override(self, monkeypatch):
-        from tide2.actors import llm_recognizer
-
-        mock_worker = MagicMock()
-        monkeypatch.setattr(llm_recognizer, "LlmRecognizerWorker", mock_worker)
-
-        llm_recognizer.LlmRecognizerSupervisor(project_id="proj", worker_num_cpus=0.0)
-
-        mock_worker.options.assert_called_once_with(num_cpus=0.0)
-        mock_worker.options.return_value.remote.assert_called_once()
-        mock_worker.remote.assert_not_called()
+        # Worker class passed directly to map_batches
+        assert captured_map_batches["fn"] is RecognizerWorker
+        strategy = captured_map_batches["kwargs"]["compute"]
+        assert isinstance(strategy, ray.data.ActorPoolStrategy)
+        assert strategy.min_size == 4
+        assert strategy.max_size == 4
+        assert captured_map_batches["kwargs"]["num_cpus"] == 0.5
 
 
 # ---------------------------------------------------------------------------
@@ -121,14 +98,14 @@ class TestConfigureCheckpoint:
 
     def test_enabled_sets_config(self, tmp_path):
         ctx = SimpleNamespace(checkpoint_config=None)
-        output_dir = tmp_path / "06_anonymizer_output"
+        output_dir = tmp_path / "anonymizer_output"
         _configure_checkpoint(ctx, enable=True, output_dir=output_dir, id_column="text_hash")
 
         cfg = ctx.checkpoint_config
         assert cfg is not None
         assert cfg.id_column == "text_hash"
         # Sibling directory next to the output dir, suffixed _ray_checkpoint.
-        assert cfg.checkpoint_path == str(output_dir.parent / "06_anonymizer_output_ray_checkpoint")
+        assert cfg.checkpoint_path == str(output_dir.parent / "anonymizer_output_ray_checkpoint")
         assert cfg.delete_checkpoint_on_success is False
 
     def test_enabled_respects_id_column(self, tmp_path):
@@ -214,7 +191,7 @@ class TestPerOperatorReservations:
         monkeypatch.setattr(
             lr,
             "detect_columns",
-            lambda *_a, **_k: ["text_hash", "note_text", "recognizer_results_json", "patient_uid"],
+            lambda *_a, **_k: ["text_hash", "note_text", "recognizer_results_json", "patient_id"],
         )
         salt_file = tmp_path / "salt.bin"
         key_file = tmp_path / "key.bin"
@@ -253,13 +230,16 @@ class TestPerOperatorReservations:
         assert captured_ds["read"]["ray_remote_args"] == {"num_cpus": 0.25}
         assert captured_ds["write"]["ray_remote_args"] == {"num_cpus": 0.5}
 
-    def test_transformer_read_write_flat_map(self, monkeypatch, tmp_path, captured_ds):
+    def test_transformer_read_write(self, monkeypatch, tmp_path, captured_ds):
         runner = _make_runner(monkeypatch)
+        monkeypatch.setattr(lr, "detect_columns", lambda *_a, **_k: ["text_hash", "note_text"])
         # Avoid ray.cluster_resources(): force CPU-only, single actor each.
         monkeypatch.setattr(runner, "_resolve_transformer_resources", lambda *_a, **_k: (0, True, 1, 1))
         from tide2.transformers import config as tconfig
 
-        monkeypatch.setattr(tconfig, "load_model_config", lambda _name: {"CHUNK_SIZE": 512, "CHUNK_OVERLAP_SIZE": 40})
+        monkeypatch.setattr(
+            tconfig, "load_model_config", lambda _name: {"CHUNK_OVERLAP_SIZE": 40, "MODEL_MAX_LENGTH": 512}
+        )
         from tide2 import actors
 
         monkeypatch.setattr(actors, "create_transformer_actor", lambda **_k: MagicMock())
@@ -270,14 +250,32 @@ class TestPerOperatorReservations:
             model_name="fake-model",
             model_path=str(tmp_path / "model"),  # skip resolve_model_path download
             read_cpus=0.25,
-            flat_map_cpus=0.3,
             write_cpus=0.5,
             enable_checkpoint=False,
         )
 
+        # No char-chunking flat_map any more: whole notes flow straight to the actor.
         assert captured_ds["read"]["ray_remote_args"] == {"num_cpus": 0.25}
-        assert captured_ds["flat_map"]["num_cpus"] == 0.3
+        assert "flat_map" not in captured_ds
         assert captured_ds["write"]["ray_remote_args"] == {"num_cpus": 0.5}
+
+    def test_transformer_missing_model_max_length_raises_on_driver(self, monkeypatch, tmp_path):
+        """run_transformer fails fast on the driver if MODEL_MAX_LENGTH is absent."""
+        runner = _make_runner(monkeypatch)
+        monkeypatch.setattr(runner, "_resolve_transformer_resources", lambda *_a, **_k: (0, True, 1, 1))
+        from tide2.transformers import config as tconfig
+
+        # Config with no MODEL_MAX_LENGTH — the single length authority is missing.
+        monkeypatch.setattr(tconfig, "load_model_config", lambda _name: {"CHUNK_OVERLAP_SIZE": 40})
+
+        with pytest.raises(ValueError, match="MODEL_MAX_LENGTH"):
+            runner.run_transformer(
+                input_path="in",
+                output_path=str(tmp_path / "out"),
+                model_name="fake-model",
+                model_path=str(tmp_path / "model"),
+                enable_checkpoint=False,
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -334,3 +332,44 @@ def test_cli_llm_recognizer_forwards_cpu_knobs(monkeypatch):
     assert captured["worker_num_cpus"] == 0.0
     assert captured["write_cpus"] == 0.25
     assert captured["enable_checkpoint"] is False
+
+
+@pytest.mark.parametrize("flag", [("--cpus-per-actor", "0.5"), ("--batch-timeout", "100"), ("--chunk-size", "512")])
+def test_cli_rejects_the_removed_flags(monkeypatch, flag):
+    """The flags that were deprecated and ignored are gone, so argparse refuses them."""
+    from tide2.runner import cli
+
+    monkeypatch.setattr("sys.argv", ["tide2-runner", "run", "recognizer", "-i", "in", "-o", "out", *flag])
+
+    with pytest.raises(SystemExit) as exc:
+        cli.main()
+
+    assert exc.value.code == 2
+
+
+def test_cli_small_box_recipe_from_readme_parses(monkeypatch):
+    """The README small-box recipe parses and reserves 1.5 CPUs per recognizer and anonymizer slot."""
+    from tide2.runner import cli
+    from tide2.runner.local_runner import LocalJobRunner
+
+    captured: dict = {}
+
+    def fake_run_pipeline(self, **kwargs):
+        captured.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(LocalJobRunner, "run_pipeline", fake_run_pipeline)
+    monkeypatch.setattr(LocalJobRunner, "shutdown", lambda _self: None)
+    recipe = (
+        "tide2-runner run pipeline -i in.parquet -o out --model StanfordAIMI/stanford-deidentifier-v2 "
+        "--num-actors 1 --worker-num-cpus 1.5 --read-cpus 0.25 --write-cpus 0.25 "
+        "--agg-num-cpus 0.5 --transformer-cpus 0.25 --no-checkpoint"
+    )
+    monkeypatch.setattr("sys.argv", recipe.split())
+
+    cli.main()
+
+    for stage in ("recognizer_kwargs", "anonymizer_kwargs"):
+        kwargs = captured[stage]
+        assert "num_cpus" not in kwargs
+        assert _resolve_slot_cpus(kwargs["worker_num_cpus"])[0] == 1.5

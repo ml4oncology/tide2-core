@@ -4,6 +4,7 @@ TIDE 2.0 Runner CLI.
 
 Commands:
     run             Run a processing job (recognition, anonymization, transformer)
+    visualizer-json Write the JSON files that tide2-visualizer reads, from a finished run
 
 Usage Examples:
     # Run recognition locally
@@ -18,6 +19,8 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+
+from tide2.runner.fault_tolerance import configure_data_context
 
 logger = logging.getLogger(__name__)
 
@@ -39,21 +42,27 @@ def cmd_run(args: argparse.Namespace) -> None:
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
 
+    no_prog = getattr(args, "no_progress_timeout_s", None)
+    hw_tune = getattr(args, "hardware_autotune", None) is not False
+
     runner = LocalJobRunner(
         num_cpus=args.num_cpus,
         num_gpus=args.num_gpus,
         object_store_gb=args.object_store_gb,
         include_dashboard=getattr(args, "include_dashboard", False),
+        no_progress_timeout_s=no_prog,
+        hardware_autotune=hw_tune,
     )
 
     dry_run = getattr(args, "dry_run", False)
+
+    if no_prog is not None:
+        configure_data_context(no_progress_timeout_s=no_prog)
 
     # Collect optional kwargs — only pass if explicitly set so runner uses its defaults
     optional_kwargs: dict = {}
     for attr, key in [
         ("batch_size", "batch_size"),
-        ("batch_timeout", "batch_timeout"),
-        ("cpus_per_actor", "num_cpus"),
         ("read_parallelism", "read_parallelism"),
         ("read_cpus", "read_cpus"),
         ("read_op_min_num_blocks", "read_op_min_num_blocks"),
@@ -62,6 +71,7 @@ def cmd_run(args: argparse.Namespace) -> None:
         ("worker_num_cpus", "worker_num_cpus"),
         ("write_cpus", "write_cpus"),
         ("enable_checkpoint", "enable_checkpoint"),
+        ("override_num_blocks", "override_num_blocks"),
     ]:
         val = getattr(args, attr, None)
         if val is not None:
@@ -105,51 +115,23 @@ def cmd_run(args: argparse.Namespace) -> None:
                 ("model_path", "model_path"),
                 ("bucket_name", "bucket_name"),
                 ("project_id", "project_id"),
-                ("chunk_size", "chunk_size"),
                 ("chunk_overlap", "chunk_overlap"),
-                ("compile_cache_path", "compile_cache_path"),
                 ("num_agg_actors", "num_agg_actors"),
-                ("short_seq_budget", "short_seq_budget"),
                 ("read_cpus", "read_cpus"),
-                ("flat_map_cpus", "flat_map_cpus"),
                 ("write_cpus", "write_cpus"),
                 ("agg_num_cpus", "agg_num_cpus"),
                 ("transformer_cpus", "transformer_cpus"),
                 ("enable_checkpoint", "enable_checkpoint"),
+                ("override_num_blocks", "override_num_blocks"),
             ]:
                 val = getattr(args, attr, None)
                 if val is not None:
                     transformer_kwargs[key] = val
-            if getattr(args, "compile_model", False):
-                transformer_kwargs["compile_model"] = True
-            if getattr(args, "pre_chunked", False):
-                transformer_kwargs["pre_chunked"] = True
             result = runner.run_transformer(
                 input_path=args.input,
                 output_path=args.output,
                 model_name=args.model,
                 **transformer_kwargs,
-            )
-        elif args.job_type == "reassembly":
-            if not args.model:
-                print("Error: --model is required for reassembly jobs")
-                sys.exit(1)
-
-            reassembly_kwargs: dict = {}
-            for attr, key in [
-                ("num_actors", "num_actors"),
-                ("batch_size", "batch_size"),
-                ("cpus_per_actor", "num_cpus"),
-            ]:
-                val = getattr(args, attr, None)
-                if val is not None:
-                    reassembly_kwargs[key] = val
-
-            result = runner.run_reassembly(
-                input_path=args.input,
-                output_path=args.output,
-                model_name=args.model,
-                **reassembly_kwargs,
             )
         elif args.job_type == "llm-recognizer":
             if not args.project_id:
@@ -168,8 +150,6 @@ def cmd_run(args: argparse.Namespace) -> None:
                 ("max_retries", "max_retries"),
                 ("num_actors", "num_actors"),
                 ("batch_size", "batch_size"),
-                ("batch_timeout", "batch_timeout"),
-                ("cpus_per_actor", "num_cpus"),
                 ("worker_num_cpus", "worker_num_cpus"),
                 ("read_parallelism", "read_parallelism"),
                 ("read_cpus", "read_cpus"),
@@ -200,38 +180,33 @@ def cmd_run(args: argparse.Namespace) -> None:
             t_kw: dict = {}
             for attr, key in [
                 ("num_gpus", "num_gpus"),
+                ("gpu_batch_size", "gpu_batch_size"),
                 ("bucket_name", "bucket_name"),
                 ("project_id", "project_id"),
-                ("chunk_size", "chunk_size"),
                 ("chunk_overlap", "chunk_overlap"),
                 ("batch_size", "batch_size"),
                 ("model_path", "model_path"),
-                ("compile_cache_path", "compile_cache_path"),
                 ("num_agg_actors", "num_agg_actors"),
-                ("short_seq_budget", "short_seq_budget"),
                 ("read_cpus", "read_cpus"),
-                ("flat_map_cpus", "flat_map_cpus"),
                 ("write_cpus", "write_cpus"),
                 ("agg_num_cpus", "agg_num_cpus"),
                 ("transformer_cpus", "transformer_cpus"),
                 ("enable_checkpoint", "enable_checkpoint"),
+                ("override_num_blocks", "override_num_blocks"),
             ]:
                 val = getattr(args, attr, None)
                 if val is not None:
                     t_kw[key] = val
-            if getattr(args, "compile_model", False):
-                t_kw["compile_model"] = True
 
             r_kw: dict = {}
             for attr, key in [
                 ("num_actors", "num_actors"),
                 ("batch_size", "batch_size"),
-                ("batch_timeout", "batch_timeout"),
-                ("cpus_per_actor", "num_cpus"),
                 ("read_cpus", "read_cpus"),
                 ("worker_num_cpus", "worker_num_cpus"),
                 ("write_cpus", "write_cpus"),
                 ("enable_checkpoint", "enable_checkpoint"),
+                ("override_num_blocks", "override_num_blocks"),
             ]:
                 val = getattr(args, attr, None)
                 if val is not None:
@@ -246,13 +221,13 @@ def cmd_run(args: argparse.Namespace) -> None:
             for attr, key in [
                 ("num_actors", "num_actors"),
                 ("batch_size", "batch_size"),
-                ("cpus_per_actor", "num_cpus"),
                 ("acc_num_salt", "acc_num_salt"),
                 ("acc_num_study_id", "acc_num_study_id"),
                 ("read_cpus", "read_cpus"),
                 ("worker_num_cpus", "worker_num_cpus"),
                 ("write_cpus", "write_cpus"),
                 ("enable_checkpoint", "enable_checkpoint"),
+                ("override_num_blocks", "override_num_blocks"),
             ]:
                 val = getattr(args, attr, None)
                 if val is not None:
@@ -286,7 +261,6 @@ def cmd_run(args: argparse.Namespace) -> None:
                     ("max_retries", "max_retries"),
                     ("num_actors", "num_actors"),
                     ("batch_size", "batch_size"),
-                    ("batch_timeout", "batch_timeout"),
                     ("prompt_name", "prompt_name"),
                 ]:
                     val = getattr(args, attr, None)
@@ -294,13 +268,9 @@ def cmd_run(args: argparse.Namespace) -> None:
                         llm_kw[key] = val
 
             result = runner.run_pipeline(
-                input_data=args.input,
+                input_path=args.input,
                 output_dir=args.output,
                 model_name=args.model,
-                run_transformer=getattr(args, "run_transformer", True),
-                run_recognizer=getattr(args, "run_recognizer", True),
-                run_anonymizer=getattr(args, "run_anonymizer", True),
-                produce_visualizer_json=getattr(args, "produce_visualizer_json", False),
                 salt_hex=getattr(args, "salt_hex", "00" * 32),
                 key_hex=getattr(args, "key_hex", "11" * 32),
                 transformer_kwargs=t_kw,
@@ -308,6 +278,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                 anonymizer_kwargs=a_kw,
                 llm_recognizer_mode=llm_mode,
                 llm_recognizer_kwargs=llm_kw if llm_kw else None,
+                execution_mode=getattr(args, "execution_mode", None) or "discrete",
             )
         else:
             print(f"Unknown job type: {args.job_type}")
@@ -333,8 +304,43 @@ def cmd_run(args: argparse.Namespace) -> None:
         runner.shutdown()
 
 
-def main() -> None:
+def cmd_visualizer_json(args: argparse.Namespace) -> None:
+    """Write the visualizer JSON files for a finished pipeline run."""
+    from tide2.runner.utils import write_visualizer_json
+
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+    try:
+        counts = write_visualizer_json(args.output, args.json_dir)
+    except ValueError as exc:
+        print(f"Error: {exc}")
+        sys.exit(1)
+    for name, count in counts.items():
+        print(f"  {name}: {count:,}")
+
+
+def main(argv: list[str] | None = None) -> None:
     """Main entry point for the CLI."""
+    if argv is None:
+        argv = sys.argv[1:]
+
+    # Intercept removed 'reassembly' stage before parsing
+    if "reassembly" in argv:
+        try:
+            run_idx = argv.index("run")
+            pos_args = [tok for tok in argv[run_idx + 1 :] if not tok.startswith("-")]
+            if pos_args and pos_args[0] == "reassembly":
+                sys.stderr.write(
+                    "error: 'reassembly' stage has been removed. Chunk reassembly is now performed "
+                    "automatically in the transformer stage (token-accurate windowing + BIO aggregation). "
+                    "Please remove this step from your workflow.\n"
+                )
+                sys.exit(2)
+        except ValueError:
+            pass
+
     parser = argparse.ArgumentParser(
         prog="tide2-runner",
         description="TIDE 2.0 Runner - Run recognition/anonymization jobs on a single node",
@@ -362,24 +368,43 @@ Examples:
     )
     run_p.add_argument(
         "job_type",
-        choices=["recognizer", "anonymizer", "transformer", "reassembly", "pipeline", "llm-recognizer"],
+        choices=["recognizer", "anonymizer", "transformer", "pipeline", "llm-recognizer"],
         help="Type of job to run",
     )
     run_p.add_argument("--config", "-c", help="Path to YAML config file (CLI flags override config values)")
     run_p.add_argument("--input", "-i", help="Input path (local dir or gs://)")
-    run_p.add_argument("--output", "-o", help="Output path")
+    run_p.add_argument(
+        "--output",
+        "-o",
+        help="Output path: local dir, network mount, or gs://. Re-running with the same output path resumes: "
+        "notes already written are skipped. Use one live job per output path.",
+    )
     run_p.add_argument("--num-actors", type=int, help="Number of actors (auto-detect if not set)")
     run_p.add_argument("--batch-size", type=int, help="Batch size per actor (default: 150 recognizer, 200 anonymizer)")
-    run_p.add_argument("--batch-timeout", type=int, help="Batch timeout in seconds (default: 120, recognizer only)")
+    run_p.add_argument(
+        "--no-progress-timeout",
+        dest="no_progress_timeout_s",
+        type=float,
+        help="Execution-level timeout in seconds for Ray Data hang detection (default: 600, -1 disables)",
+    )
     run_p.add_argument("--num-cpus", type=int, help="Total CPUs for Ray cluster")
-    run_p.add_argument("--num-gpus", type=int, help="Number of GPUs (transformer jobs)")
+    run_p.add_argument(
+        "--num-gpus",
+        type=float,
+        help="Number of GPUs (transformer jobs, supports fractional e.g. 0.33 for GPU multiplexing)",
+    )
+    run_p.add_argument(
+        "--override-num-blocks",
+        type=int,
+        help="Explicit number of Ray Data blocks to split input into (e.g. 32 to fix block starvation)",
+    )
     run_p.add_argument(
         "--gpu-batch-size",
         type=int,
-        help="GPU batch size for HF pipeline inference (transformer jobs, auto-computed if not set)",
+        help="Token windows per GPU forward (transformer jobs). Size for the load; "
+        "the actor halves and retries on OOM. Nominal default if not set.",
     )
     run_p.add_argument("--object-store-gb", type=int, help="Object store memory in GB")
-    run_p.add_argument("--cpus-per-actor", type=int, help="CPUs per actor (default: 2)")
     run_p.add_argument("--read-parallelism", type=int, help="Number of read output blocks")
     run_p.add_argument("--read-cpus", type=float, help="CPUs per read task (default: 0.25)")
     run_p.add_argument("--read-op-min-num-blocks", type=int, help="Min read output blocks (default: 200)")
@@ -388,18 +413,12 @@ Examples:
     run_p.add_argument(
         "--worker-num-cpus",
         type=float,
-        help="CPUs per supervisor worker actor (recognizer/anonymizer/llm-recognizer/pipeline). "
-        "Lower (with --cpus-per-actor) to fit small boxes; default: Ray default (1)",
+        help="CPUs per actor (recognizer/anonymizer/llm-recognizer/pipeline). Lower to fit small boxes; default: 1",
     )
     run_p.add_argument(
         "--write-cpus",
         type=float,
         help="CPUs per write_parquet task (recognizer/anonymizer/transformer/llm-recognizer/pipeline, default: 1.0)",
-    )
-    run_p.add_argument(
-        "--flat-map-cpus",
-        type=float,
-        help="CPUs per chunking flat_map task (transformer/pipeline jobs, default: 1.0)",
     )
     run_p.add_argument(
         "--agg-num-cpus",
@@ -419,32 +438,22 @@ Examples:
         default=None,
         help="Disable Ray Data row-level checkpointing (recognizer/anonymizer/transformer/"
         "llm-recognizer/pipeline). REQUIRED on tiny clusters (≲4 CPUs, e.g. Colab): the checkpoint "
-        "shuffle deadlocks Ray's reservation allocator. Trades resume capability, not correctness.",
+        "shuffle deadlocks Ray's reservation allocator. Trades resume capability, not correctness. "
+        "With checkpointing on, a restart on the same output path skips notes already written.",
     )
     run_p.add_argument("--model", help="Model name (required for transformer jobs)")
     run_p.add_argument("--model-path", help="Explicit local path to model (transformer jobs)")
     run_p.add_argument("--bucket-name", help="GCS bucket for model loading (transformer jobs)")
     run_p.add_argument("--project-id", help="GCP project ID for model loading (transformer jobs)")
-    run_p.add_argument("--chunk-size", type=int, help="Max chunk size in tokens (transformer jobs, default: 512)")
     run_p.add_argument(
-        "--chunk-overlap", type=int, help="Overlap between chunks in tokens (transformer jobs, default: 40)"
-    )
-    run_p.add_argument(
-        "--compile-model", action="store_true", help="Apply torch.compile with mega-cache (transformer jobs)"
-    )
-    run_p.add_argument("--compile-cache-path", help="Path to compiled cache .bin file (transformer jobs)")
-    run_p.add_argument(
-        "--pre-chunked", action="store_true", help="Input is pre-chunked, skip chunking step (transformer jobs only)"
+        "--chunk-overlap",
+        type=int,
+        help="Token overlap between adjacent windows for over-budget notes (transformer/pipeline jobs, default: 40)",
     )
     run_p.add_argument(
         "--num-agg-actors",
         type=int,
         help="Number of CPU actors for BIO aggregation (transformer jobs, auto-computed if not set)",
-    )
-    run_p.add_argument(
-        "--short-seq-budget",
-        type=float,
-        help="Memory budget fraction for short sequences (transformer jobs, auto-computed from GPU VRAM if not set)",
     )
     run_p.add_argument("--salt", help="Path to salt file (required for anonymizer jobs)")
     run_p.add_argument("--key", help="Path to key file (required for anonymizer jobs)")
@@ -456,29 +465,6 @@ Examples:
         help="Fail notes that have no jitter value instead of computing one (anonymizer/pipeline jobs)",
     )
     # Pipeline-specific arguments
-    run_p.add_argument(
-        "--no-transformer",
-        dest="run_transformer",
-        action="store_false",
-        help="Skip transformer stage (pipeline jobs, default: run)",
-    )
-    run_p.add_argument(
-        "--no-recognizer",
-        dest="run_recognizer",
-        action="store_false",
-        help="Skip recognizer stage (pipeline jobs, default: run)",
-    )
-    run_p.add_argument(
-        "--no-anonymizer",
-        dest="run_anonymizer",
-        action="store_false",
-        help="Skip anonymizer stage (pipeline jobs, default: run)",
-    )
-    run_p.add_argument(
-        "--produce-visualizer-json",
-        action="store_true",
-        help="Write JSON files for tide2-visualizer (pipeline jobs)",
-    )
     run_p.add_argument("--salt-hex", default="00" * 32, help="Hex-encoded FPE salt (pipeline jobs)")
     run_p.add_argument("--key-hex", default="11" * 32, help="Hex-encoded FPE key (pipeline jobs)")
     run_p.add_argument("--cpu-batch-size", type=int, help="Batch size for CPU actors (pipeline jobs, default: 100)")
@@ -546,6 +532,25 @@ Examples:
         default=None,
         help="LLM prompt name in resources/llm_prompts/ or path to a prompt directory (default: phi_detection)",
     )
+    run_p.add_argument(
+        "--no-hardware-autotune",
+        dest="hardware_autotune",
+        action="store_false",
+        # None (not True) so _apply_config can tell "unset" from "explicitly on" and
+        # a YAML `hardware_autotune: false` is honoured; unset resolves to True.
+        default=None,
+        help="Disable automatic hardware-based setting recommendations (default: enabled)",
+    )
+    run_p.add_argument(
+        "--execution-mode",
+        choices=["discrete", "streamed"],
+        default=None,
+        help="Pipeline execution mode (pipeline jobs, default: discrete). 'discrete' runs each stage as its "
+        "own Ray Data execution with a Parquet boundary between them — required for multi-machine runs, "
+        "for ≲4-CPU boxes, and for row-level resume. 'streamed' chains the stages into one execution on a "
+        "single node, skipping the intermediate Parquet round-trips and overlapping GPU with CPU; it checkpoints "
+        "only its final output and writes only anonymizer_output",
+    )
     run_p.add_argument("--dry-run", action="store_true", help="Validate setup without processing")
     run_p.add_argument("--include-dashboard", action="store_true", help="Enable Ray dashboard (port 8265)")
     run_p.add_argument(
@@ -553,17 +558,46 @@ Examples:
     )
     run_p.set_defaults(func=cmd_run)
 
+    # =========================================================================
+    # visualizer-json command
+    # =========================================================================
+    viz_p = subparsers.add_parser(
+        "visualizer-json",
+        help="Write the JSON files that tide2-visualizer reads, from a finished pipeline run",
+    )
+    viz_p.add_argument("--output", "-o", required=True, help="Local output folder of the pipeline run")
+    viz_p.add_argument(
+        "--json-dir", help="Folder for cli_recognizer_json/ and cli_anonymizer_json/ (default: --output)"
+    )
+    viz_p.add_argument(
+        "--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR"], help="Logging level"
+    )
+    viz_p.set_defaults(func=cmd_visualizer_json)
+
     # Parse and execute
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     # If --config provided on the 'run' command, load YAML and backfill unset args
     if args.command == "run" and getattr(args, "config", None):
-        _apply_config(args)
+        _apply_config(args, run_p, argv)
 
     args.func(args)
 
 
-def _apply_config(args: argparse.Namespace) -> None:
+def _cli_supplied_dests(run_parser: argparse.ArgumentParser, argv: list[str]) -> set[str]:
+    """Return the dests the user actually typed on the command line.
+
+    The parsed value alone cannot tell us this: an explicit
+    ``--no-hardware-autotune`` and an unset ``--jitter-required`` both read
+    as ``False``. Matching argv against each action's option strings is what keeps
+    "CLI flags always override config values" true for the negative flags.
+    """
+    typed = {token.split("=", 1)[0] for token in argv if token.startswith("-")}
+    # argparse exposes no public accessor for its actions.
+    return {action.dest for action in run_parser._actions if typed.intersection(action.option_strings)}
+
+
+def _apply_config(args: argparse.Namespace, run_parser: argparse.ArgumentParser, argv: list[str] | None = None) -> None:
     """Load YAML config and set any arg that wasn't provided on the command line."""
     import yaml
 
@@ -577,10 +611,9 @@ def _apply_config(args: argparse.Namespace) -> None:
 
     # Map YAML keys (underscore) to argparse dest names
     # YAML uses the same names as argparse dest (e.g. num_actors, batch_size)
+    supplied = _cli_supplied_dests(run_parser, sys.argv[1:] if argv is None else argv)
     for key, value in config.items():
-        current = getattr(args, key, None)
-        # Only backfill if the CLI didn't set it (None for optional args, False for flags)
-        if current is None or (isinstance(current, bool) and not current and isinstance(value, bool)):
+        if key not in supplied:
             setattr(args, key, value)
 
 
