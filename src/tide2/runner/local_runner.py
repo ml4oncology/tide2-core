@@ -164,6 +164,7 @@ def _configure_checkpoint(
     fractional-CPU knobs + ``enable=False`` are the validated fix.
     """
     if enable:
+        _validate_id_column(id_column)
         if isinstance(output_dir, Path):
             checkpoint_dir = str(output_dir.parent / (output_dir.name + "_ray_checkpoint"))
         else:
@@ -175,6 +176,15 @@ def _configure_checkpoint(
         )
     else:
         ctx.checkpoint_config = None
+
+
+SUPPORTED_ID_COLUMNS: tuple[str, ...] = ("row_id", "text_hash")
+
+
+def _validate_id_column(id_column: str) -> None:
+    """Validate that id_column is one of the supported checkpoint primary keys."""
+    if id_column not in SUPPORTED_ID_COLUMNS:
+        raise ValueError(f"Invalid _id_column: {id_column!r}. Must be one of {SUPPORTED_ID_COLUMNS}.")
 
 
 DEFAULT_ROW_ID_PATIENT_ID = "None"
@@ -1030,7 +1040,7 @@ class LocalJobRunner:
         enable_checkpoint: bool = True,
         override_num_blocks: int | None = None,
         dry_run: bool = False,
-        _id_column: str = "text_hash",
+        _id_column: str = "row_id",
     ) -> dict[str, Any]:
         """
         Run recognition job with Ray Data checkpointing for resume.
@@ -1071,10 +1081,13 @@ class LocalJobRunner:
             override_num_blocks: Explicit number of Ray Data blocks to split the
                 input into (e.g. 32 to fix single-block starvation on multicore nodes).
             dry_run: If True, validate setup and show plan without processing
+            _id_column: Column name to use as primary key for Ray Data checkpointing
+                (default: "row_id").
 
         Returns:
             Processing statistics dictionary
         """
+        _validate_id_column(_id_column)
         self._init_ray()
 
         # Override DataContext with job-specific streaming params
@@ -1225,7 +1238,7 @@ class LocalJobRunner:
         write_cpus: float = 1.0,
         enable_checkpoint: bool = True,
         dry_run: bool = False,
-        _id_column: str = "text_hash",
+        _id_column: str = "row_id",
     ) -> dict[str, Any]:
         """
         Run LLM-based recognition job with Ray Data checkpointing for resume.
@@ -1272,10 +1285,13 @@ class LocalJobRunner:
                 skips notes already written to ``output_path``; use one live job
                 per ``output_path``.
             dry_run: If True, validate setup and show plan without processing
+            _id_column: Column name to use as primary key for Ray Data checkpointing
+                (default: "row_id").
 
         Returns:
             Processing statistics dictionary
         """
+        _validate_id_column(_id_column)
         self._init_ray()
 
         # Override DataContext with job-specific streaming params
@@ -1485,6 +1501,8 @@ class LocalJobRunner:
             salt_hex: Hex-encoded 32-byte FPE salt, instead of ``salt_path`` (use with ``key_hex``).
             key_hex: Hex-encoded 32-byte FPE key, instead of ``key_path`` (use with ``salt_hex``).
             dry_run: If True, validate setup and show plan without processing
+            _id_column: Column name to use as primary key for Ray Data checkpointing
+                (default: "row_id").
 
         Returns:
             Processing statistics dictionary, including ``output_rows`` (the number
@@ -1498,6 +1516,7 @@ class LocalJobRunner:
         """
         from tide2.actors import create_anonymizer_actor_class
 
+        _validate_id_column(_id_column)
         self._init_ray()
 
         # Override DataContext with job-specific streaming params
@@ -1651,7 +1670,7 @@ class LocalJobRunner:
         finally:
             shutdown.restore_handlers()
 
-    def run_transformer(
+    def run_transformer(  # noqa: PLR0915
         self,
         input_path: str | list[str],
         output_path: str,
@@ -1671,7 +1690,7 @@ class LocalJobRunner:
         transformer_cpus: float | None = None,
         enable_checkpoint: bool = True,
         override_num_blocks: int | None = None,
-        _id_column: str = "text_hash",
+        _id_column: str = "row_id",
     ) -> dict[str, Any]:
         """
         Run transformer NER job with token-accurate windowing.
@@ -1772,6 +1791,8 @@ class LocalJobRunner:
                 ``output_path``; use one live job per ``output_path``.
             override_num_blocks: Explicit number of Ray Data blocks to split the
                 input into.
+            _id_column: Column name to use as primary key for Ray Data checkpointing
+                (default: "row_id").
 
         Returns:
             Processing statistics dictionary
@@ -1779,6 +1800,7 @@ class LocalJobRunner:
         from tide2.actors import create_transformer_actor
         from tide2.transformers.config import load_model_config
 
+        _validate_id_column(_id_column)
         self._init_ray()
         start_time = time.time()
 
@@ -1933,6 +1955,7 @@ class LocalJobRunner:
         llm_recognizer_mode: str = "off",
         llm_recognizer_kwargs: dict[str, Any] | None = None,
         execution_mode: Literal["discrete", "streamed"] = "discrete",
+        _id_column: str = "row_id",
     ) -> dict[str, Any]:
         """
         Run the full de-identification pipeline.
@@ -1963,9 +1986,10 @@ class LocalJobRunner:
         for development, benchmarks, and single-box batches. Trade-offs:
 
         - **Resume only at the sink.** With ``enable_checkpoint`` on (the default),
-          the final sink is checkpointed on ``row_id``: a rerun of the same input
-          into the same ``output_dir`` skips rows already written and processes
-          the rest through all stages. Stages are not checkpointed, so a failed
+          the final sink is checkpointed on ``row_id`` (or ``text_hash`` when configured
+          via ``_id_column`` or overridden by ``anonymizer_kwargs["_id_column"]``):
+          a rerun of the same input into the same ``output_dir`` skips rows already written
+          and processes the rest through all stages. Stages are not checkpointed, so a failed
           run re-runs GPU inference for every unfinished row. Long-running or
           unattended jobs should stay on discrete.
         - Only ``anonymizer_output`` is written; the other stage folders are not.
@@ -2050,6 +2074,9 @@ class LocalJobRunner:
                 e.g. project_id, model_name, provider_type, context_length,
                 max_tokens, num_actors, batch_size.
             execution_mode: "discrete" (default) or "streamed" — see above.
+            _id_column: Primary key column for stage checkpointing ("row_id" or "text_hash",
+                default: "row_id"). In streamed mode, controls the anonymizer sink checkpoint
+                key unless overridden by anonymizer_kwargs["_id_column"].
 
         Returns:
             Dictionary with per-stage statistics and output paths in discrete
@@ -2057,6 +2084,10 @@ class LocalJobRunner:
             "input_rows", "output_rows", "dropped_rows", "output_dir",
             "operator_stats"}``. Both carry ``execution_mode``.
         """
+        _validate_id_column(_id_column)
+        for stage_kwargs in (transformer_kwargs, recognizer_kwargs, anonymizer_kwargs, llm_recognizer_kwargs):
+            if stage_kwargs and "_id_column" in stage_kwargs:
+                _validate_id_column(stage_kwargs["_id_column"])
         start_time = time.time()
         output_path = output_location(output_dir)
         make_output_dir(output_path)
@@ -2154,6 +2185,7 @@ class LocalJobRunner:
                 llm_recognizer_mode=llm_recognizer_mode,
                 llm_recognizer_kwargs=dict(llm_kw),
                 start_time=start_time,
+                _id_column=_id_column,
             )
 
         results["execution_mode"] = "discrete"
@@ -2172,6 +2204,7 @@ class LocalJobRunner:
         # Phase 1: Transformer NER
         # ------------------------------------------------------------------
         t_kwargs: dict[str, Any] = dict(t_kw)
+        t_id = t_kwargs.pop("_id_column", _id_column)
 
         if llm_recognizer_mode == "only":
             logger.info("Pipeline phase 1/3: Transformer NER (SKIPPED — LLM-only mode)")
@@ -2181,7 +2214,7 @@ class LocalJobRunner:
                 input_path=first_stage_input_path,
                 output_path=str(transformer_output_path),
                 model_name=model_name,
-                _id_column="row_id",
+                _id_column=t_id,
                 **t_kwargs,
             )
             results["transformer"] = transformer_manifest
@@ -2195,11 +2228,13 @@ class LocalJobRunner:
         if llm_recognizer_mode == "only":
             # LLM replaces both transformer and regex recognizer
             logger.info("Pipeline phase 2/3: LLM Recognizer (only mode)")
+            llm_kwargs: dict[str, Any] = dict(llm_kw)
+            llm_id = llm_kwargs.pop("_id_column", _id_column)
             llm_manifest = self.run_llm_recognition(
                 input_path=first_stage_input_path,
                 output_path=str(llm_recognizer_output_path),
-                _id_column="row_id",
-                **llm_kw,
+                _id_column=llm_id,
+                **llm_kwargs,
             )
             results["llm_recognizer"] = llm_manifest
 
@@ -2208,20 +2243,23 @@ class LocalJobRunner:
             logger.info("Pipeline phase 2/3: Recognizer + LLM Recognizer (merge mode)")
 
             # --- Standard regex recognizer ---
+            r_id = r_kwargs.pop("_id_column", _id_column)
             recognizer_manifest = self.run_recognition(
                 input_path=rec_input_path,
                 output_path=str(recognizer_output_path),
-                _id_column="row_id",
+                _id_column=r_id,
                 **r_kwargs,
             )
             results["recognizer"] = recognizer_manifest
 
             # --- LLM recognizer ---
+            llm_kwargs = dict(llm_kw)
+            llm_id = llm_kwargs.pop("_id_column", _id_column)
             llm_manifest = self.run_llm_recognition(
                 input_path=rec_input_path,
                 output_path=str(llm_recognizer_output_path),
-                _id_column="row_id",
-                **llm_kw,
+                _id_column=llm_id,
+                **llm_kwargs,
             )
             results["llm_recognizer"] = llm_manifest
 
@@ -2295,10 +2333,11 @@ class LocalJobRunner:
 
         else:
             logger.info("Pipeline phase 2/3: Recognizer")
+            r_id = r_kwargs.pop("_id_column", _id_column)
             recognizer_manifest = self.run_recognition(
                 input_path=rec_input_path,
                 output_path=str(recognizer_output_path),
-                _id_column="row_id",
+                _id_column=r_id,
                 **r_kwargs,
             )
             results["recognizer"] = recognizer_manifest
@@ -2314,13 +2353,15 @@ class LocalJobRunner:
         write_text_file(salt_file, salt_hex)
         write_text_file(key_file, key_hex)
 
+        a_kwargs: dict[str, Any] = dict(a_kw)
+        a_id = a_kwargs.pop("_id_column", _id_column)
         anonymizer_manifest = self.run_anonymization(
             input_path=str(final_recognizer_path),
             output_path=str(anonymizer_output_path),
             salt_path=str(salt_file),
             key_path=str(key_file),
-            _id_column="row_id",
-            **dict(a_kw),
+            _id_column=a_id,
+            **a_kwargs,
         )
         results["anonymizer"] = anonymizer_manifest
 
@@ -2451,6 +2492,7 @@ class LocalJobRunner:
         llm_recognizer_mode: str,
         llm_recognizer_kwargs: dict[str, Any],
         start_time: float,
+        _id_column: str = "row_id",
     ) -> dict[str, Any]:
         """Chain the enabled stages into a single Ray Data execution.
 
@@ -2551,7 +2593,20 @@ class LocalJobRunner:
         ctx = ray.data.DataContext.get_current()
         sink_dir = anonymizer_output_path
         sink_dir.mkdir(parents=True, exist_ok=True)
-        _configure_checkpoint(ctx, enable=enable_checkpoint, output_dir=sink_dir, id_column="row_id")
+        # Strip and validate _id_column from every stage kwargs dict so they do not leak
+        # into worker constructors (e.g. LlmRecognizerWorker) and cannot pass invalid names.
+        a_id = anonymizer_kwargs.pop("_id_column", None)
+        r_id = recognizer_kwargs.pop("_id_column", None)
+        t_id = transformer_kwargs.pop("_id_column", None)
+        llm_id = llm_recognizer_kwargs.pop("_id_column", None)
+        for stage_val in (a_id, r_id, t_id, llm_id):
+            if stage_val is not None:
+                _validate_id_column(stage_val)
+        # In streamed mode, the anonymizer is the sole checkpointed sink; select the
+        # anonymizer override if supplied, otherwise the pipeline-level _id_column.
+        streamed_id = a_id if a_id is not None else _id_column
+        _validate_id_column(streamed_id)
+        _configure_checkpoint(ctx, enable=enable_checkpoint, output_dir=sink_dir, id_column=streamed_id)
 
         input_rows = input_info.num_rows
         num_blocks = next(
@@ -2738,6 +2793,7 @@ def run_recognition_simple(
     batch_size: int = 150,
     num_cpus: int | None = None,
     object_store_gb: int | None = None,
+    _id_column: str = "row_id",
 ) -> dict[str, Any]:
     """
     Simple function to run recognition job.
@@ -2749,6 +2805,7 @@ def run_recognition_simple(
         batch_size: Batch size
         num_cpus: CPUs
         object_store_gb: Object store size GB
+        _id_column: Column to use for checkpointing (default: "row_id")
 
     Returns:
         Processing statistics
@@ -2764,6 +2821,7 @@ def run_recognition_simple(
             output_path=output_path,
             num_actors=num_actors,
             batch_size=batch_size,
+            _id_column=_id_column,
         )
     finally:
         runner.shutdown()
@@ -2778,6 +2836,7 @@ def run_anonymization_simple(
     batch_size: int = 200,
     num_cpus: int | None = None,
     object_store_gb: int | None = None,
+    _id_column: str = "row_id",
 ) -> dict[str, Any]:
     """
     Simple function to run anonymization job.
@@ -2791,6 +2850,7 @@ def run_anonymization_simple(
         batch_size: Batch size
         num_cpus: CPUs
         object_store_gb: Object store size GB
+        _id_column: Column to use for checkpointing (default: "row_id")
 
     Returns:
         Processing statistics
@@ -2808,6 +2868,7 @@ def run_anonymization_simple(
             key_path=key_path,
             num_actors=num_actors,
             batch_size=batch_size,
+            _id_column=_id_column,
         )
     finally:
         runner.shutdown()
@@ -2825,6 +2886,7 @@ def run_transformer_simple(
     num_cpus: int | None = None,
     object_store_gb: int | None = None,
     num_agg_actors: int | None = None,
+    _id_column: str = "row_id",
 ) -> dict[str, Any]:
     """
     Simple function to run transformer NER job.
@@ -2841,6 +2903,7 @@ def run_transformer_simple(
         num_cpus: CPUs
         object_store_gb: Object store size GB
         num_agg_actors: Number of CPU actors for BIO aggregation (auto if None)
+        _id_column: Column to use for checkpointing (default: "row_id")
 
     Returns:
         Processing statistics
@@ -2862,6 +2925,7 @@ def run_transformer_simple(
             batch_size=batch_size,
             chunk_overlap=chunk_overlap,
             num_agg_actors=num_agg_actors,
+            _id_column=_id_column,
         )
     finally:
         runner.shutdown()
@@ -2880,6 +2944,7 @@ def run_pipeline_simple(
     anonymizer_kwargs: dict[str, Any] | None = None,
     llm_recognizer_mode: str = "off",
     llm_recognizer_kwargs: dict[str, Any] | None = None,
+    _id_column: str = "row_id",
 ) -> dict[str, Any]:
     """
     Simple function to run the full de-identification pipeline.
@@ -2896,6 +2961,7 @@ def run_pipeline_simple(
         anonymizer_kwargs: Extra kwargs passed to run_anonymization().
         llm_recognizer_mode: "off", "only", or "merge".
         llm_recognizer_kwargs: Extra kwargs passed to run_llm_recognition().
+        _id_column: Primary key column for stage checkpointing (default: "row_id").
 
     Returns:
         Pipeline statistics dictionary.
@@ -2916,6 +2982,7 @@ def run_pipeline_simple(
             anonymizer_kwargs=anonymizer_kwargs,
             llm_recognizer_mode=llm_recognizer_mode,
             llm_recognizer_kwargs=llm_recognizer_kwargs,
+            _id_column=_id_column,
         )
     finally:
         runner.shutdown()
