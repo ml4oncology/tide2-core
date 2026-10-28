@@ -97,7 +97,8 @@ _STRING_COLUMNS = (
 )
 
 
-def _string_value(value: Any) -> str | None:
+def string_value(value: Any) -> str | None:
+    """Return *value* as the string a string output column stores (NaN to None, ``5.0`` to ``"5"``)."""
     if value is None or isinstance(value, str):
         return value
     if is_null(value):
@@ -125,7 +126,7 @@ def type_columns(res: dict[str, Any]) -> dict[str, Any]:
     """
     for names, convert, arrow_type in (
         (_INT_COLUMNS, _int_value, pa.int64()),
-        (_STRING_COLUMNS, _string_value, pa.string()),
+        (_STRING_COLUMNS, string_value, pa.string()),
     ):
         for name in names:
             values = res.get(name)

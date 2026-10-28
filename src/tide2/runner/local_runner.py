@@ -55,6 +55,7 @@ from ray.data.checkpoint import CheckpointConfig
 from ray.data.dataset import Dataset
 
 from tide2.utils.batch_columns import check_no_patient_uid
+from tide2.utils.batch_columns import string_value
 from tide2.utils.nulls import row_id_patient_part
 from tide2.utils.stage_status import FAILED
 from tide2.utils.stage_status import merge_stage_status
@@ -216,10 +217,17 @@ def add_row_id(table: pa.Table) -> pa.Table:
     share a row_id, and tide2 does not deduplicate them: once one is committed by
     a checkpointed run, the others are treated as already processed on resume.
     Supply a unique row_id column to give each source row its own identity.
+
+    A supplied row_id is always returned as string: the stages write row_id as string,
+    so the checkpoint stores string ids, and Ray compares them with the ids read here
+    on resume. An integer row_id left as is would fail that comparison.
     """
     has_row_id = "row_id" in table.column_names
     if has_row_id and table["row_id"].null_count == 0:
-        return table
+        if pa.types.is_string(table["row_id"].type):
+            return table
+        as_string = pa.array([string_value(v) for v in table["row_id"].to_pylist()], type=pa.string())
+        return table.set_column(table.column_names.index("row_id"), "row_id", as_string)
 
     n = len(table)
     patient_ids = table["patient_id"].to_pylist() if "patient_id" in table.column_names else [None] * n
@@ -232,7 +240,7 @@ def add_row_id(table: pa.Table) -> pa.Table:
     if not has_row_id:
         return table.append_column("row_id", pa.array(derived, type=pa.string()))
     # A null in a supplied row_id would reach the checkpoint as one shared identity.
-    supplied = table["row_id"].cast(pa.string()).to_pylist()
+    supplied = [string_value(v) for v in table["row_id"].to_pylist()]
     filled = [d if v is None else v for v, d in zip(supplied, derived, strict=True)]
     return table.set_column(table.column_names.index("row_id"), "row_id", pa.array(filled, type=pa.string()))
 

@@ -96,6 +96,26 @@ def test_add_row_id_without_null_ids_returns_the_table_unchanged():
     assert add_row_id(table) is table
 
 
+@pytest.mark.parametrize("arrow_type", [pa.uint32(), pa.int64(), pa.float64()])
+def test_add_row_id_gives_a_numeric_row_id_the_string_ids_the_checkpoint_stores(arrow_type):
+    # The stages write row_id as string, so on resume Ray compares the checkpoint's
+    # string ids with these; a numeric row_id here would raise a TypeError.
+    table = pa.table({"text_hash": ["a", "b"], "row_id": pa.array([12345, 7], type=arrow_type)})
+
+    out = add_row_id(table)
+
+    assert out["row_id"].type == pa.string()
+    assert out["row_id"].to_pylist() == ["12345", "7"]
+
+
+def test_add_row_id_fills_nulls_in_a_numeric_row_id_as_strings():
+    table = pa.table({"text_hash": ["a", "b"], "row_id": pa.array([5, None], type=pa.int64())})
+
+    out = add_row_id(table).to_pydict()
+
+    assert out["row_id"] == ["5", hashlib.sha256(b"b:None").hexdigest()]
+
+
 # ---------------------------------------------------------------------------
 # URI-aware path helpers
 # ---------------------------------------------------------------------------
