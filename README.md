@@ -625,6 +625,18 @@ masked or the row failed. With `anonymized_note_text` it undoes the date shift, 
 give it the same access control as `salt.bin` and `key.bin` and drop it before
 release. `patient_id` is written as a string, whatever its input type.
 
+**Label masking.** To replace each entity with its type label instead of a
+surrogate (`John Smith` → `[PATIENT]`, `Toronto` → `[LOCATION]`), pass
+`--mask-all` (YAML `mask_all: true`, or `mask_all=True` to `run_anonymization`).
+Every entity uses the `masking` operator, dates are masked rather than shifted
+(so `jitter` is null), and `--salt`/`--key` become optional because no
+cryptographic operator runs. The label is the recognizer's entity type, so name
+spans can appear as `[PATIENT]`, `[DOCTOR]`, `[HCW]` or `[PERSON]`.
+
+```bash
+tide2-runner run anonymizer -i ./data/recognized -o ./data/masked --mask-all
+```
+
 **Known limitations**
 
 - All input files must have the same columns. The column list is read from the

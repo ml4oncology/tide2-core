@@ -84,31 +84,37 @@ class AnonymizerWorker:
 
     def __init__(
         self,
-        salt: bytes,
-        key: bytes,
+        salt: bytes | None,
+        key: bytes | None,
         acc_num_salt: str | None = None,
         acc_num_study_id: str | None = None,
         jitter_required: bool = False,
+        mask_all: bool = False,
     ) -> None:
         """
         Initialize the worker with an AnonymizerEngine.
 
         Args:
-            salt: 32-byte salt for HIPS anonymizers.
-            key: 32-byte key for HIPS anonymizers.
+            salt: 32-byte salt for HIPS anonymizers. May be None with ``mask_all``.
+            key: 32-byte key for HIPS anonymizers. May be None with ``mask_all``.
             acc_num_salt: Salt for accession number hashing (fixed per run).
             acc_num_study_id: Study ID for accession number hashing (fixed per run).
             jitter_required: If True, notes without a jitter value fail instead
                 of computing one automatically.
+            mask_all: If True, every entity is replaced with its ``[<entity_type>]``
+                label (e.g. ``[PATIENT]``) instead of a surrogate, and dates are masked
+                rather than shifted. Salt and key are then optional, since no
+                cryptographic operator runs.
         """
-        if salt is None or key is None:
-            raise ValueError("Both salt and key must be provided")
+        if not mask_all:
+            if salt is None or key is None:
+                raise ValueError("Both salt and key must be provided")
 
-        if len(salt) != REQUIRED_KEY_SIZE:
-            raise ValueError(f"salt must be {REQUIRED_KEY_SIZE} bytes, got {len(salt)}")
+            if len(salt) != REQUIRED_KEY_SIZE:
+                raise ValueError(f"salt must be {REQUIRED_KEY_SIZE} bytes, got {len(salt)}")
 
-        if len(key) != REQUIRED_KEY_SIZE:
-            raise ValueError(f"key must be {REQUIRED_KEY_SIZE} bytes, got {len(key)}")
+            if len(key) != REQUIRED_KEY_SIZE:
+                raise ValueError(f"key must be {REQUIRED_KEY_SIZE} bytes, got {len(key)}")
 
         # Apply Presidio patches - must be done in __init__ (not module level)
         # for Ray workers since they are separate processes.
@@ -120,6 +126,7 @@ class AnonymizerWorker:
         self.acc_num_salt = acc_num_salt
         self.acc_num_study_id = acc_num_study_id
         self.jitter_required = jitter_required
+        self.mask_all = mask_all
 
         # Suppress short input warnings in batch processing (reduces log noise)
         FormatPreservingEncryption.suppress_short_input_warnings = True
@@ -247,6 +254,10 @@ class AnonymizerWorker:
         Returns:
             Dictionary of operator configurations for this note.
         """
+        if self.mask_all:
+            # Presidio applies DEFAULT to every entity type without its own entry
+            return {"DEFAULT": OperatorConfig("masking")}
+
         operators = self._base_operators.copy()
 
         # Random jitter between 4-60 days if not provided
@@ -494,9 +505,9 @@ class AnonymizerWorker:
 
         events = start_note()
         try:
-            # With jitter_required and no jitter, dates are masked instead of shifted
-            mask_dates = False
-            if is_null(jitter):
+            # With mask_all, or jitter_required and no jitter, dates are masked instead of shifted
+            mask_dates = self.mask_all
+            if is_null(jitter) and not mask_dates:
                 if self.jitter_required:
                     mask_dates = True
                     record_error("DATE", "jitter_required")
@@ -683,11 +694,12 @@ def _load_key_material(key_material: bytes | str | os.PathLike) -> bytes:
 
 
 def create_anonymizer_actor(
-    salt: bytes | str | os.PathLike,
-    key: bytes | str | os.PathLike,
+    salt: bytes | str | os.PathLike | None,
+    key: bytes | str | os.PathLike | None,
     acc_num_salt: str | None = None,
     acc_num_study_id: str | None = None,
     jitter_required: bool = False,
+    mask_all: bool = False,
 ) -> type[AnonymizerWorker]:
     """
     Factory function to create an AnonymizerWorker subclass with specific keys.
@@ -696,12 +708,14 @@ def create_anonymizer_actor(
     making it work for both local/batch processing and cluster modes.
 
     Args:
-        salt: 32-byte salt (bytes) or path to salt file
-        key: 32-byte key (bytes) or path to key file
+        salt: 32-byte salt (bytes) or path to salt file; may be None with ``mask_all``
+        key: 32-byte key (bytes) or path to key file; may be None with ``mask_all``
         acc_num_salt: Salt for accession number hashing (fixed per run)
         acc_num_study_id: Study ID for accession number hashing (fixed per run)
         jitter_required: If True, notes without a jitter value fail instead
             of computing one automatically
+        mask_all: If True, every entity is replaced with its ``[<entity_type>]``
+            label; see ``AnonymizerWorker``
 
     Returns:
         A class that can be used with Ray Data's map_batches()
@@ -717,8 +731,8 @@ def create_anonymizer_actor(
         Actor = create_anonymizer_actor(Path("/keys/salt.key"), key_bytes)
     """
     # Load key material (handles both bytes and file paths)
-    salt_bytes = _load_key_material(salt)
-    key_bytes = _load_key_material(key)
+    salt_bytes = None if salt is None else _load_key_material(salt)
+    key_bytes = None if key is None else _load_key_material(key)
 
     class ConfiguredAnonymizerActor(AnonymizerWorker):
         """Pre-configured AnonymizerWorker with captured key material."""
@@ -730,6 +744,7 @@ def create_anonymizer_actor(
                 acc_num_salt=acc_num_salt,
                 acc_num_study_id=acc_num_study_id,
                 jitter_required=jitter_required,
+                mask_all=mask_all,
             )
 
     return ConfiguredAnonymizerActor
