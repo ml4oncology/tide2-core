@@ -1456,6 +1456,7 @@ class LocalJobRunner:
         acc_num_salt: str | None = None,
         acc_num_study_id: str | None = None,
         jitter_required: bool = False,
+        mask_all: bool = False,
         worker_num_cpus: int | float | None = None,
         write_cpus: float = 1.0,
         enable_checkpoint: bool = True,
@@ -1490,6 +1491,8 @@ class LocalJobRunner:
             acc_num_study_id: Study ID for accession number hashing
             jitter_required: If True, notes without a jitter value fail instead
                 of computing one automatically
+            mask_all: If True, replace every entity with its ``[<entity_type>]`` label
+                (e.g. ``[PATIENT]``) and mask dates; the salt/key pair is then optional.
             worker_num_cpus: CPUs reserved for each actor (None = 1.0); lower it to fit
                 small boxes.
             write_cpus: CPUs to reserve for each write_parquet task. Default 1.0
@@ -1539,13 +1542,19 @@ class LocalJobRunner:
 
         start_time = time.time()
 
-        # Load keys: exactly one complete pair, both as files or both as hex strings
+        # Load keys: exactly one complete pair, both as files or both as hex strings.
+        # mask_all runs no cryptographic operator, so it may pass neither pair.
         files_given = (salt_path is not None, key_path is not None)
         hex_given = (salt_hex is not None, key_hex is not None)
-        if not (all(files_given) and not any(hex_given)) and not (all(hex_given) and not any(files_given)):
-            raise ValueError("Pass salt_path and key_path, or salt_hex and key_hex, and nothing from the other pair.")
-        salt = self._load_key(salt_path) if salt_hex is None else self._decode_key(salt_hex)
-        key = self._load_key(key_path) if key_hex is None else self._decode_key(key_hex)
+        salt: bytes | None = None
+        key: bytes | None = None
+        if not (mask_all and not any(files_given + hex_given)):
+            if not (all(files_given) and not any(hex_given)) and not (all(hex_given) and not any(files_given)):
+                raise ValueError(
+                    "Pass salt_path and key_path, or salt_hex and key_hex, and nothing from the other pair."
+                )
+            salt = self._load_key(salt_path) if salt_hex is None else self._decode_key(salt_hex)
+            key = self._load_key(key_path) if key_hex is None else self._decode_key(key_hex)
 
         output_dir = output_location(output_path, resolve=True)
         make_output_dir(output_dir)
@@ -1590,6 +1599,7 @@ class LocalJobRunner:
             acc_num_salt=acc_num_salt,
             acc_num_study_id=acc_num_study_id,
             jitter_required=jitter_required,
+            mask_all=mask_all,
         )
 
         try:
@@ -2698,6 +2708,7 @@ class LocalJobRunner:
                 acc_num_salt=anonymizer_kwargs.get("acc_num_salt"),
                 acc_num_study_id=anonymizer_kwargs.get("acc_num_study_id"),
                 jitter_required=bool(anonymizer_kwargs.get("jitter_required", False)),
+                mask_all=bool(anonymizer_kwargs.get("mask_all", False)),
             )
             ds = self.build_anonymizer_stage(
                 ds,

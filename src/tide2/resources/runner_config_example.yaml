@@ -63,6 +63,7 @@ key: /mnt/gcs/tide2/arpah_prod_key.key
 # acc_num_salt: "your-salt-here"
 # acc_num_study_id: "your-study-id-here"
 # jitter_required: false
+# mask_all: false  # replace every entity with its [ENTITY_TYPE] label; salt/key optional
 
 # =========================================================================
 # Transformer-specific

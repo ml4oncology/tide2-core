@@ -96,8 +96,9 @@ def cmd_run(args: argparse.Namespace) -> None:
                 **optional_kwargs,
             )
         elif args.job_type == "anonymizer":
-            if not args.salt or not args.key:
-                print("Error: --salt and --key are required for anonymizer jobs")
+            mask_all = bool(getattr(args, "mask_all", False))
+            if not mask_all and (not args.salt or not args.key):
+                print("Error: --salt and --key are required for anonymizer jobs (unless --mask-all)")
                 sys.exit(1)
 
             result = runner.run_anonymization(
@@ -109,6 +110,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                 acc_num_salt=args.acc_num_salt,
                 acc_num_study_id=args.acc_num_study_id,
                 jitter_required=getattr(args, "jitter_required", False),
+                mask_all=mask_all,
                 dry_run=dry_run,
                 **optional_kwargs,
             )
@@ -229,6 +231,8 @@ def cmd_run(args: argparse.Namespace) -> None:
             a_kw: dict = {}
             if getattr(args, "jitter_required", False):
                 a_kw["jitter_required"] = True
+            if getattr(args, "mask_all", False):
+                a_kw["mask_all"] = True
             for attr, key in [
                 ("num_actors", "num_actors"),
                 ("batch_size", "batch_size"),
@@ -482,6 +486,13 @@ Examples:
         "--jitter-required",
         action="store_true",
         help="Fail notes that have no jitter value instead of computing one (anonymizer/pipeline jobs)",
+    )
+    run_p.add_argument(
+        "--mask-all",
+        action="store_true",
+        help="Replace every entity with its [ENTITY_TYPE] label (e.g. [PATIENT], [LOCATION]) instead of "
+        "a surrogate, and mask dates instead of shifting them. --salt/--key are then optional "
+        "(anonymizer/pipeline jobs)",
     )
     # Pipeline-specific arguments
     run_p.add_argument("--salt-hex", default="00" * 32, help="Hex-encoded FPE salt (pipeline jobs)")
