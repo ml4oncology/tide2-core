@@ -5,6 +5,7 @@ The tests need no Ray cluster and no GPU: machines are built by hand.
 
 import argparse
 import inspect
+import os
 import subprocess
 import sys
 
@@ -543,6 +544,41 @@ def test_init_ray_applies_an_explicit_object_store_gb(monkeypatch):
     LocalJobRunner(object_store_gb=2)._init_ray()
 
     assert captured["object_store_memory"] == 2 * 1024**3
+
+
+def test_init_ray_passes_the_detected_machine_so_ray_skips_its_own_detection(monkeypatch):
+    """Ray's own CPU/GPU detection hangs on some HPC nodes, so the runner always passes both counts."""
+    import tide2.runner.local_runner as lr
+
+    captured: dict = {}
+    monkeypatch.setattr(lr, "detect_machine", lambda: REFERENCE)
+    monkeypatch.setattr(lr.ray, "init", lambda **kwargs: captured.update(kwargs))
+    monkeypatch.setattr(lr, "log_ray_cluster_info", lambda: None)
+    monkeypatch.setattr(lr, "configure_data_context", lambda **_kwargs: None)
+    monkeypatch.setenv("RAY_ADDRESS", "10.0.0.1:6379")
+    monkeypatch.setenv("RAY_USAGE_STATS_ENABLED", "1")
+
+    LocalJobRunner()._init_ray()
+
+    assert (captured["num_cpus"], captured["num_gpus"]) == (REFERENCE.cpus, REFERENCE.gpus)
+    assert captured["_node_ip_address"] == "127.0.0.1"
+    assert "runtime_env" in captured
+    assert "RAY_ADDRESS" not in os.environ
+    assert os.environ["RAY_USAGE_STATS_ENABLED"] == "0"
+
+
+def test_init_ray_prefers_explicit_cpu_and_gpu_counts(monkeypatch):
+    import tide2.runner.local_runner as lr
+
+    captured: dict = {}
+    monkeypatch.setattr(lr, "detect_machine", lambda: REFERENCE)
+    monkeypatch.setattr(lr.ray, "init", lambda **kwargs: captured.update(kwargs))
+    monkeypatch.setattr(lr, "log_ray_cluster_info", lambda: None)
+    monkeypatch.setattr(lr, "configure_data_context", lambda **_kwargs: None)
+
+    LocalJobRunner(num_cpus=4, num_gpus=0.33)._init_ray()
+
+    assert (captured["num_cpus"], captured["num_gpus"]) == (4, 1)
 
 
 def test_no_progress_timeout_is_sticky_across_stages():

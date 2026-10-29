@@ -816,23 +816,41 @@ class LocalJobRunner:
         if self.include_dashboard and dashboard_host == DEFAULT_DASHBOARD_HOST:
             dashboard_host = "0.0.0.0"  # noqa: S104 # nosec B104 # we run in docker
 
+        # Disable usage stats reporting: on air-gapped nodes the outbound HTTP
+        # call blocks indefinitely, hanging ray.init() after the local instance starts.
+        os.environ["RAY_USAGE_STATS_ENABLED"] = "0"
+        # Don't inherit a stale RAY_ADDRESS from the shell — that would make
+        # ray.init() try to join an existing (possibly dead) cluster head instead
+        # of starting a new local one.
+        os.environ.pop("RAY_ADDRESS", None)
+
+        # Force loopback so the GCS server and the driver's gRPC channel both bind
+        # to 127.0.0.1. On HPC clusters, firewalls often block connections to the
+        # node's actual IP even from the same process, which hangs the driver after
+        # the local Ray instance starts.
         kwargs: dict[str, Any] = {
             "ignore_reinit_error": True,
             "include_dashboard": self.include_dashboard,
             "dashboard_host": dashboard_host,
+            "_node_ip_address": "127.0.0.1",
             # Configure the CUDA allocator (expandable_segments) for GPU actors
             # before CUDA initializes in the worker. Fragmentation mitigation, not
             # a leak fix. See runner.utils.gpu_worker_runtime_env.
             "runtime_env": gpu_worker_runtime_env(),
         }
 
-        if self.num_cpus:
-            kwargs["num_cpus"] = self.num_cpus
+        # Always pass num_cpus and num_gpus explicitly: Ray's own cgroup- and
+        # pynvml-based auto-detection hangs on some HPC clusters. detect_machine
+        # counts only the CPUs allocated to this job (SLURM affinity, cgroup quota)
+        # and reads GPUs via nvidia-smi, so Ray does not over-provision a shared node.
+        kwargs["num_cpus"] = self.num_cpus or detect_machine().cpus
         if self.num_gpus is not None:
             # ray.init needs integer physical GPU count for cluster capacity;
             # fractional values (e.g. 0.33) represent per-actor allocations.
-            cluster_gpus = math.ceil(self.num_gpus) if self.num_gpus > 0 else 0
-            kwargs["num_gpus"] = cluster_gpus
+            kwargs["num_gpus"] = math.ceil(self.num_gpus) if self.num_gpus > 0 else 0
+        else:
+            kwargs["num_gpus"] = detect_machine().gpus
+
         if self.object_store_gb:
             kwargs["object_store_memory"] = self.object_store_gb * 1024**3
 
