@@ -12,7 +12,8 @@ Output columns:
     - anonymized_note_text: The anonymized text
     - anonymizer_results_json: JSON with anonymization details
     - entity_count: Number of entities anonymized
-    - jitter: Date shift in days that was applied (input or derived); null when dates were masked or the row failed
+    - jitter: Date shift in days that was applied (input or derived); null when dates were masked or kept,
+      or the row failed
     - processing_timestamp: ISO timestamp of processing
     - processing_status: ``success``, ``degraded`` or ``failed`` (worst across stages)
     - stage_status_json: per-stage status and reason (see ``tide2.utils.stage_status``)
@@ -90,6 +91,7 @@ class AnonymizerWorker:
         acc_num_study_id: str | None = None,
         jitter_required: bool = False,
         mask_all: bool = False,
+        keep_dates: bool = False,
     ) -> None:
         """
         Initialize the worker with an AnonymizerEngine.
@@ -105,6 +107,9 @@ class AnonymizerWorker:
                 label (e.g. ``[PATIENT]``) instead of a surrogate, and dates are masked
                 rather than shifted. Salt and key are then optional, since no
                 cryptographic operator runs.
+            keep_dates: If True, ``DATE`` and ``DATE_TIME`` entities are left
+                unchanged instead of shifted or masked, and no jitter is computed
+                or required. Takes precedence over ``mask_all`` for dates only.
         """
         if not mask_all:
             if salt is None or key is None:
@@ -127,6 +132,7 @@ class AnonymizerWorker:
         self.acc_num_study_id = acc_num_study_id
         self.jitter_required = jitter_required
         self.mask_all = mask_all
+        self.keep_dates = keep_dates
 
         # Suppress short input warnings in batch processing (reduces log noise)
         FormatPreservingEncryption.suppress_short_input_warnings = True
@@ -254,9 +260,11 @@ class AnonymizerWorker:
         Returns:
             Dictionary of operator configurations for this note.
         """
+        date_keep = {"DATE_TIME": OperatorConfig("keep"), "DATE": OperatorConfig("keep")}
+
         if self.mask_all:
             # Presidio applies DEFAULT to every entity type without its own entry
-            return {"DEFAULT": OperatorConfig("masking")}
+            return {"DEFAULT": OperatorConfig("masking"), **(date_keep if self.keep_dates else {})}
 
         operators = self._base_operators.copy()
 
@@ -264,7 +272,9 @@ class AnonymizerWorker:
         if date_jitter is None:
             date_jitter = secrets.randbelow(57) + 4
 
-        if mask_dates:
+        if self.keep_dates:
+            operators.update(date_keep)
+        elif mask_dates:
             operators.update({"DATE_TIME": OperatorConfig("masking"), "DATE": OperatorConfig("masking")})
         else:
             operators.update(
@@ -505,9 +515,12 @@ class AnonymizerWorker:
 
         events = start_note()
         try:
-            # With mask_all, or jitter_required and no jitter, dates are masked instead of shifted
+            # With mask_all, or jitter_required and no jitter, dates are masked instead of shifted.
+            # With keep_dates, dates are left unchanged, so no jitter is needed or reported.
             mask_dates = self.mask_all
-            if is_null(jitter) and not mask_dates:
+            if self.keep_dates:
+                jitter = None
+            elif is_null(jitter) and not mask_dates:
                 if self.jitter_required:
                     mask_dates = True
                     record_error("DATE", "jitter_required")
@@ -575,7 +588,7 @@ class AnonymizerWorker:
             "anonymized_note_text": anonymized_text,
             "anonymizer_results_json": anonymizer_json,
             "entity_count": entity_count,
-            "jitter": None if mask_dates else jitter,
+            "jitter": None if mask_dates or self.keep_dates else jitter,
             "stage_status": stage_status,
             "stage_reason": stage_reason,
         }
@@ -700,6 +713,7 @@ def create_anonymizer_actor(
     acc_num_study_id: str | None = None,
     jitter_required: bool = False,
     mask_all: bool = False,
+    keep_dates: bool = False,
 ) -> type[AnonymizerWorker]:
     """
     Factory function to create an AnonymizerWorker subclass with specific keys.
@@ -716,6 +730,7 @@ def create_anonymizer_actor(
             of computing one automatically
         mask_all: If True, every entity is replaced with its ``[<entity_type>]``
             label; see ``AnonymizerWorker``
+        keep_dates: If True, dates are left unchanged; see ``AnonymizerWorker``
 
     Returns:
         A class that can be used with Ray Data's map_batches()
@@ -745,6 +760,7 @@ def create_anonymizer_actor(
                 acc_num_study_id=acc_num_study_id,
                 jitter_required=jitter_required,
                 mask_all=mask_all,
+                keep_dates=keep_dates,
             )
 
     return ConfiguredAnonymizerActor

@@ -1475,6 +1475,7 @@ class LocalJobRunner:
         acc_num_study_id: str | None = None,
         jitter_required: bool = False,
         mask_all: bool = False,
+        keep_dates: bool = False,
         worker_num_cpus: int | float | None = None,
         write_cpus: float = 1.0,
         enable_checkpoint: bool = True,
@@ -1511,6 +1512,8 @@ class LocalJobRunner:
                 of computing one automatically
             mask_all: If True, replace every entity with its ``[<entity_type>]`` label
                 (e.g. ``[PATIENT]``) and mask dates; the salt/key pair is then optional.
+            keep_dates: If True, leave ``DATE``/``DATE_TIME`` entities unchanged instead of
+                shifting or masking them; the output ``jitter`` column is null.
             worker_num_cpus: CPUs reserved for each actor (None = 1.0); lower it to fit
                 small boxes.
             write_cpus: CPUs to reserve for each write_parquet task. Default 1.0
@@ -1618,6 +1621,7 @@ class LocalJobRunner:
             acc_num_study_id=acc_num_study_id,
             jitter_required=jitter_required,
             mask_all=mask_all,
+            keep_dates=keep_dates,
         )
 
         try:
@@ -2727,6 +2731,7 @@ class LocalJobRunner:
                 acc_num_study_id=anonymizer_kwargs.get("acc_num_study_id"),
                 jitter_required=bool(anonymizer_kwargs.get("jitter_required", False)),
                 mask_all=bool(anonymizer_kwargs.get("mask_all", False)),
+                keep_dates=bool(anonymizer_kwargs.get("keep_dates", False)),
             )
             ds = self.build_anonymizer_stage(
                 ds,

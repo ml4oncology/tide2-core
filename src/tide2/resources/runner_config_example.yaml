@@ -64,6 +64,7 @@ key: /mnt/gcs/tide2/arpah_prod_key.key
 # acc_num_study_id: "your-study-id-here"
 # jitter_required: false
 # mask_all: false  # replace every entity with its [ENTITY_TYPE] label; salt/key optional
+# keep_dates: false  # leave detected dates unchanged (no shift, no mask); jitter column is null
 
 # =========================================================================
 # Transformer-specific

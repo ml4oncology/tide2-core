@@ -621,7 +621,7 @@ resuming a run does not retry them.
 
 **Jitter column.** The anonymizer output has a `jitter` column: the date shift in
 days that was applied, taken from the input or derived. It is null when dates were
-masked or the row failed. With `anonymized_note_text` it undoes the date shift, so
+masked or kept, or the row failed. With `anonymized_note_text` it undoes the date shift, so
 give it the same access control as `salt.bin` and `key.bin` and drop it before
 release. `patient_id` is written as a string, whatever its input type.
 
@@ -635,6 +635,20 @@ spans can appear as `[PATIENT]`, `[DOCTOR]`, `[HCW]` or `[PERSON]`.
 
 ```bash
 tide2-runner run anonymizer -i ./data/recognized -o ./data/masked --mask-all
+```
+
+**Keeping dates.** To leave dates exactly as written (`July 11, 2025` stays
+`July 11, 2025`) while anonymizing every other entity, pass `--keep-dates` (YAML
+`keep_dates: true`, or `keep_dates=True` to `run_anonymization`). `DATE` and
+`DATE_TIME` spans use Presidio's `keep` operator, so they still appear in
+`anonymizer_results_json` with operator `keep`. No jitter is computed or required
+(`jitter_required` has no effect on dates), and the `jitter` column is null. It
+combines with `--mask-all`: dates are kept and every other entity is masked.
+Under HIPAA Safe Harbor, dates more specific than the year are identifiers, so
+output produced with `--keep-dates` is not Safe Harbor de-identified.
+
+```bash
+tide2-runner run anonymizer -i ./data/recognized -o ./data/anon --salt salt.key --key key.key --keep-dates
 ```
 
 **Known limitations**
