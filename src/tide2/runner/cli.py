@@ -111,6 +111,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                 acc_num_study_id=args.acc_num_study_id,
                 jitter_required=getattr(args, "jitter_required", False),
                 mask_all=mask_all,
+                keep_dates=bool(getattr(args, "keep_dates", False)),
                 dry_run=dry_run,
                 **optional_kwargs,
             )
@@ -233,6 +234,8 @@ def cmd_run(args: argparse.Namespace) -> None:
                 a_kw["jitter_required"] = True
             if getattr(args, "mask_all", False):
                 a_kw["mask_all"] = True
+            if getattr(args, "keep_dates", False):
+                a_kw["keep_dates"] = True
             for attr, key in [
                 ("num_actors", "num_actors"),
                 ("batch_size", "batch_size"),
@@ -492,6 +495,12 @@ Examples:
         action="store_true",
         help="Replace every entity with its [ENTITY_TYPE] label (e.g. [PATIENT], [LOCATION]) instead of "
         "a surrogate, and mask dates instead of shifting them. --salt/--key are then optional "
+        "(anonymizer/pipeline jobs)",
+    )
+    run_p.add_argument(
+        "--keep-dates",
+        action="store_true",
+        help="Leave detected dates unchanged instead of shifting or masking them; no jitter is applied "
         "(anonymizer/pipeline jobs)",
     )
     # Pipeline-specific arguments
